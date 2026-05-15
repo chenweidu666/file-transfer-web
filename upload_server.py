@@ -1,518 +1,571 @@
 #!/usr/bin/env python3
-"""文件上传服务器 — 手机浏览器传文件到电脑"""
-
-import os
-import json
-import time
-import sqlite3
 import html
-import socket
-import uuid
-from datetime import datetime
-from http.server import HTTPServer, SimpleHTTPRequestHandler
-import argparse
+import json
+import os
+import secrets
+import tempfile
+from datetime import datetime, timezone
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, quote, unquote, urlparse
+
+HOST = os.environ.get("UPLOAD_HOST", "0.0.0.0")
+PORT = int(os.environ.get("UPLOAD_PORT", "8000"))
+UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "./uploads")).resolve()
+MAX_UPLOAD_SIZE = 100 * 1024 * 1024
+CHUNK_SIZE = 64 * 1024
+AUTH_TOKEN = os.environ.get("FILE_TRANSFER_TOKEN") or secrets.token_urlsafe(32)
+
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
-class FileUploadServer:
-    def __init__(self, base_dir):
-        self.base_dir = base_dir
-        self.data_dir = os.path.join(base_dir, "data")
-        self.upload_dir = os.path.join(self.data_dir, "uploads")
-        self.db_path = os.path.join(self.data_dir, "upload.db")
-        
-        # Create directories
-        os.makedirs(self.upload_dir, exist_ok=True)
-        os.makedirs(self.data_dir, exist_ok=True)
-        
-        # Initialize database
-        self.init_db()
+def now_iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().isoformat()
 
-    def init_db(self):
-        """Initialize SQLite database for upload records."""
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS uploads (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                size INTEGER NOT NULL,
-                uploaded_at TEXT NOT NULL
+
+def sanitize_filename(filename: str) -> str:
+    filename = unquote(filename or "")
+    filename = filename.replace("\\", "/")
+    filename = os.path.basename(filename)
+    filename = os.path.normpath(filename)
+
+    if filename in {"", ".", ".."}:
+        raise ValueError("invalid filename")
+
+    cleaned = []
+    forbidden = set('/\\<>:"|?*\x00')
+    extra_xss = set("&'`")
+
+    for ch in filename:
+        code = ord(ch)
+        if code < 32 or code == 127:
+            continue
+        if ch in forbidden or ch in extra_xss:
+            cleaned.append("_")
+        else:
+            cleaned.append(ch)
+
+    safe_name = "".join(cleaned).strip().strip(".")
+    if not safe_name:
+        raise ValueError("invalid filename")
+
+    return safe_name[:255]
+
+
+def resolve_storage_path(filename: str) -> tuple[str, Path]:
+    safe_name = sanitize_filename(filename)
+    candidate = (UPLOAD_DIR / safe_name).resolve()
+
+    try:
+        if os.path.commonpath([str(UPLOAD_DIR), str(candidate)]) != str(UPLOAD_DIR):
+            raise ValueError("path traversal")
+    except ValueError:
+        raise ValueError("path traversal") from None
+
+    return safe_name, candidate
+
+
+class UploadHandler(BaseHTTPRequestHandler):
+    server_version = "SecureFileTransfer/1.0"
+
+    def log_message(self, fmt: str, *args) -> None:
+        return
+
+    def _send_bytes(self, status: int, data: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _send_json(self, status: int, payload: dict) -> None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self._send_bytes(status, data, "application/json; charset=utf-8")
+
+    def _send_html(self, status: int, html_text: str) -> None:
+        self._send_bytes(status, html_text.encode("utf-8"), "text/html; charset=utf-8")
+
+    def _send_error_json(self, status: int, message: str) -> None:
+        self._send_json(status, {"ok": False, "message": message})
+
+    def _request_token(self) -> str:
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            return auth[7:].strip()
+
+        header_token = self.headers.get("X-Auth-Token", "")
+        if header_token:
+            return header_token.strip()
+
+        query = parse_qs(urlparse(self.path).query)
+        return (query.get("token", [""])[0] or "").strip()
+
+    def _require_auth(self) -> bool:
+        token = self._request_token()
+        if not token or not secrets.compare_digest(token, AUTH_TOKEN):
+            self._send_error_json(HTTPStatus.UNAUTHORIZED, "Authentication failed.")
+            return False
+        return True
+
+    def _content_length(self) -> int:
+        raw = self.headers.get("Content-Length", "")
+        if not raw:
+            raise ValueError("missing content length")
+        size = int(raw)
+        if size < 0:
+            raise ValueError("invalid content length")
+        return size
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/":
+            if not self._require_auth():
+                return
+            self._send_html(HTTPStatus.OK, self._render_index())
+            return
+
+        if parsed.path == "/api/files":
+            if not self._require_auth():
+                return
+            self._handle_list_files()
+            return
+
+        if parsed.path == "/download":
+            if not self._require_auth():
+                return
+            self._handle_download()
+            return
+
+        self._send_error_json(HTTPStatus.NOT_FOUND, "Request failed.")
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/upload":
+            if not self._require_auth():
+                return
+            self._handle_upload()
+            return
+
+        self._send_error_json(HTTPStatus.NOT_FOUND, "Request failed.")
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/delete":
+            if not self._require_auth():
+                return
+            self._handle_delete()
+            return
+
+        self._send_error_json(HTTPStatus.NOT_FOUND, "Request failed.")
+
+    def _handle_list_files(self) -> None:
+        items = []
+        try:
+            for entry in sorted(UPLOAD_DIR.iterdir(), key=lambda p: p.name.lower()):
+                if not entry.is_file():
+                    continue
+                stat = entry.stat()
+                items.append(
+                    {
+                        "name": entry.name,
+                        "size": stat.st_size,
+                        "modifiedAt": now_iso(stat.st_mtime),
+                    }
+                )
+        except OSError:
+            self._send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, "File operation failed.")
+            return
+
+        self._send_json(HTTPStatus.OK, {"ok": True, "files": items})
+
+    def _handle_upload(self) -> None:
+        raw_name = self.headers.get("X-Filename", "")
+        if not raw_name:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid request.")
+            return
+
+        try:
+            file_size = self._content_length()
+            if file_size > MAX_UPLOAD_SIZE:
+                self._send_error_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Request rejected.")
+                return
+
+            safe_name, target_path = resolve_storage_path(raw_name)
+
+            fd, temp_path_str = tempfile.mkstemp(prefix=".upload-", suffix=".tmp", dir=str(UPLOAD_DIR))
+            temp_path = Path(temp_path_str)
+
+            written = 0
+            try:
+                with os.fdopen(fd, "wb") as tmp:
+                    remaining = file_size
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(CHUNK_SIZE, remaining))
+                        if not chunk:
+                            raise IOError("incomplete upload")
+                        written += len(chunk)
+                        if written > MAX_UPLOAD_SIZE:
+                            raise IOError("size limit exceeded")
+                        tmp.write(chunk)
+                        remaining -= len(chunk)
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
+
+                if written != file_size:
+                    raise IOError("size mismatch")
+
+                os.replace(temp_path, target_path)
+            except Exception:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+
+        except ValueError:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "Invalid request.")
+            return
+        except OSError:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "File operation failed.")
+            return
+        except Exception:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "Request failed.")
+            return
+
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "file": {
+                    "name": safe_name,
+                    "size": written,
+                },
+            },
+        )
+
+    def _handle_download(self) -> None:
+        try:
+            query = parse_qs(urlparse(self.path).query)
+            raw_name = query.get("file", [""])[0]
+            _, path = resolve_storage_path(raw_name)
+
+            if not path.is_file():
+                self._send_error_json(HTTPStatus.NOT_FOUND, "Request failed.")
+                return
+
+            file_size = path.stat().st_size
+            download_name = quote(path.name)
+
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(file_size))
+            self.send_header(
+                "Content-Disposition",
+                f"attachment; filename*=UTF-8''{download_name}",
             )
-        """)
-        conn.commit()
-        conn.close()
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
 
-    def add_upload_record(self, filename, size):
-        """Add a record of uploaded file to the database."""
-        conn = sqlite3.connect(self.db_path)
-        record_id = uuid.uuid4().hex[:12]
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        conn.execute(
-            "INSERT INTO uploads (id, name, size, uploaded_at) VALUES (?, ?, ?, ?)",
-            (record_id, filename, size, timestamp)
-        )
-        conn.commit()
-        conn.close()
-        return record_id
+            with path.open("rb") as fh:
+                while True:
+                    chunk = fh.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except (ValueError, OSError):
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "File operation failed.")
+        except Exception:
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "Request failed.")
 
-    def get_upload_records(self):
-        """Get all upload records from the database."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.execute(
-            "SELECT id, name, size, uploaded_at FROM uploads ORDER BY uploaded_at DESC"
-        )
-        rows = cursor.fetchall()
-        conn.close()
-        
-        return [
-            {"id": row[0], "name": row[1], "size": row[2], "uploaded_at": row[3]}
-            for row in rows
-        ]
+    def _handle_delete(self) -> None:
+        try:
+            query = parse_qs(urlparse(self.path).query)
+            raw_name = query.get("file", [""])[0]
+            _, path = resolve_storage_path(raw_name)
 
-    def delete_upload_record(self, record_id):
-        """Delete a specific upload record and associated file."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.execute(
-            "SELECT name FROM uploads WHERE id = ?", (record_id,)
-        )
-        result = cursor.fetchone()
-        
-        if result:
-            filename = result[0]
-            filepath = os.path.join(self.upload_dir, filename)
-            if os.path.exists(filepath):
-                os.remove(filepath)
-            
-            conn.execute("DELETE FROM uploads WHERE id = ?", (record_id,))
-            conn.commit()
-        
-        conn.close()
+            if not path.is_file():
+                self._send_error_json(HTTPStatus.NOT_FOUND, "Request failed.")
+                return
 
-    def clear_all_records(self):
-        """Clear all upload records and associated files."""
-        records = self.get_upload_records()
-        conn = sqlite3.connect(self.db_path)
-        
-        for record in records:
-            filepath = os.path.join(self.upload_dir, record["name"])
-            if os.path.exists(filepath):
-                os.remove(filepath)
-        
-        conn.execute("DELETE FROM uploads")
-        conn.commit()
-        conn.close()
+            path.unlink()
+        except (ValueError, OSError):
+            self._send_error_json(HTTPStatus.BAD_REQUEST, "File operation failed.")
+            return
 
+        self._send_json(HTTPStatus.OK, {"ok": True})
 
-HTML_TEMPLATE = """<!DOCTYPE html>
+    def _render_index(self) -> str:
+        token = html.escape(AUTH_TOKEN, quote=True)
+        max_mb = MAX_UPLOAD_SIZE // (1024 * 1024)
+
+        return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>文件上传</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>File Transfer</title>
   <style>
-    :root { --primary: #4f46e5; --bg: #f1f5f9; --card: #fff; }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: var(--bg); padding: 16px; }
-    .wrap { max-width: 520px; margin: 0 auto; }
-
-    /* upload card */
-    .card { background: var(--card); border-radius: 14px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 16px; }
-    .card h2 { font-size: 18px; margin-bottom: 16px; }
-
-    .drop { border: 2px dashed #cbd5e1; border-radius: 12px; padding: 28px 16px; text-align: center; cursor: pointer; transition: .2s; background: #f8fafc; }
-    .drop:hover, .drop.over { border-color: var(--primary); background: #eef2ff; }
-    .drop input { display: none; }
-    .drop p { color: #64748b; margin-top: 8px; font-size: 14px; }
-
-    .btn { display: block; width: 100%; padding: 13px; background: var(--primary); color: #fff; border: none; border-radius: 10px; font-size: 15px; font-weight: 600; margin-top: 14px; cursor: pointer; }
-    .btn:disabled { opacity: .5; }
-
-    .bar { display: none; margin-top: 12px; }
-    .bar-track { height: 8px; background: #e2e8f0; border-radius: 4px; overflow: hidden; }
-    .bar-fill { height: 100%; width: 0; background: var(--primary); border-radius: 4px; transition: width .15s; }
-    .bar-text { text-align: center; font-size: 13px; color: #64748b; margin-top: 4px; }
-
-    /* history */
-    .hist { margin-top: 8px; }
-    .hist-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-    .hist-head h3 { font-size: 16px; }
-    .hist-head button { font-size: 12px; color: #94a3b8; background: none; border: none; cursor: pointer; }
-
-    .row { display: flex; align-items: center; padding: 10px 12px; background: #f8fafc; border-radius: 10px; margin-bottom: 6px; gap: 8px; }
-    .row .info { flex: 1; min-width: 0; }
-    .row .fname { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .row meta { display: block; font-size: 12px; color: #94a3b8; }
-    .row .dl { color: var(--primary); font-size: 13px; text-decoration: none; }
-    .row .del { background: none; border: none; color: #ef4444; font-size: 18px; cursor: pointer; padding: 0 4px; }
-    .empty { text-align: center; color: #94a3b8; padding: 20px 0; font-size: 14px; }
+    :root {{
+      --bg: #f5f1e8;
+      --panel: #fffdf8;
+      --line: #d9d0c3;
+      --ink: #1d1d1b;
+      --accent: #17624a;
+      --danger: #a33a2b;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, #efe4cf 0, transparent 35%),
+        linear-gradient(180deg, #f8f4ec 0%, var(--bg) 100%);
+    }}
+    .wrap {{
+      max-width: 880px;
+      margin: 40px auto;
+      padding: 24px;
+    }}
+    .card {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 24px;
+      box-shadow: 0 12px 30px rgba(0,0,0,0.05);
+    }}
+    h1 {{ margin: 0 0 8px; font-size: 28px; }}
+    p {{ margin: 0 0 16px; color: #534c43; }}
+    .toolbar {{
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 20px;
+    }}
+    input[type=file] {{
+      flex: 1;
+      min-width: 220px;
+    }}
+    button {{
+      border: 0;
+      border-radius: 10px;
+      padding: 10px 16px;
+      background: var(--accent);
+      color: #fff;
+      cursor: pointer;
+      font-size: 14px;
+    }}
+    button.delete {{
+      background: var(--danger);
+    }}
+    button:disabled {{
+      opacity: 0.6;
+      cursor: not-allowed;
+    }}
+    .status {{
+      min-height: 24px;
+      margin-bottom: 16px;
+      color: #534c43;
+    }}
+    .file-list {{
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 12px;
+    }}
+    .file-item {{
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 12px;
+      align-items: center;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fff;
+    }}
+    .meta {{
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 0;
+    }}
+    .name {{
+      font-weight: 600;
+      word-break: break-all;
+    }}
+    .sub {{
+      font-size: 13px;
+      color: #6d655b;
+    }}
+    a {{
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: 600;
+    }}
+    @media (max-width: 640px) {{
+      .file-item {{
+        grid-template-columns: 1fr;
+      }}
+    }}
   </style>
 </head>
 <body>
-<div class="wrap">
-  <div class="card">
-    <h2>📤 上传文件</h2>
-    <form id="form">
-      <div class="drop" id="drop">
-        <span style="font-size:36px">📁</span>
-        <p>点我选择 或 拖放文件</p>
-        <input type="file" id="file" multiple>
-      </div>
-      <div class="bar" id="bar">
-        <div class="bar-track"><div class="bar-fill" id="fill"></div></div>
-        <div class="bar-text" id="btext">0%</div>
-      </div>
-      <button type="submit" class="btn" id="btn" disabled>上传选中文件</button>
-    </form>
-  </div>
+  <div class="wrap">
+    <div class="card">
+      <h1>文件传输</h1>
+      <p>单文件大小限制 {max_mb}MB。</p>
 
-  <div class="card">
-    <div class="hist">
-      <div class="hist-head">
-        <h3>📋 上传记录</h3>
-        <button id="clearBtn">清空记录</button>
+      <div class="toolbar">
+        <input id="fileInput" type="file">
+        <button id="uploadBtn">上传</button>
       </div>
-      <div id="list"><div class="empty">暂无记录</div></div>
+
+      <div id="status" class="status"></div>
+      <ul id="fileList" class="file-list"></ul>
     </div>
   </div>
-</div>
 
-<script>
-const drop=document.getElementById('drop'),file=document.getElementById('file'),
-      form=document.getElementById('form'),btn=document.getElementById('btn'),
-      bar=document.getElementById('bar'),fill=document.getElementById('fill'),
-      btext=document.getElementById('btext'),list=document.getElementById('list'),
-      clearBtn=document.getElementById('clearBtn');
+  <script>
+    const token = "{token}";
+    const maxSize = {MAX_UPLOAD_SIZE};
+    const fileInput = document.getElementById("fileInput");
+    const uploadBtn = document.getElementById("uploadBtn");
+    const statusEl = document.getElementById("status");
+    const fileList = document.getElementById("fileList");
 
-drop.onclick=()=>file.click();
-drop.ondragover=e=>{e.preventDefault();drop.classList.add('over')};
-drop.ondragleave=()=>drop.classList.remove('over');
-drop.ondrop=e=>{e.preventDefault();drop.classList.remove('over');file.files=e.dataTransfer.files;updateFileCount()};
-file.onchange=updateFileCount;
+    function setStatus(message) {{
+      statusEl.textContent = message;
+    }}
 
-function updateFileCount(){
-    const n=file.files.length;
-    btn.disabled=!n;
-    btn.textContent=n?`上传 ${n} 个文件`:'上传选中文件';
-}
+    function formatSize(bytes) {{
+      if (bytes < 1024) return bytes + " B";
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+      return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+    }}
 
-form.onsubmit=e=>{
-    e.preventDefault();
-    if(!file.files.length)return;
-    
-    bar.style.display='block';
-    btn.disabled=true;
-    btn.textContent='上传中...';
-    fill.style.width='0%';
-    
-    const fd=new FormData();
-    for(const f of file.files) fd.append('file',f,f.name);
-    
-    const xhr=new XMLHttpRequest();
-    xhr.open('POST','/upload');
-    xhr.upload.onprogress=ev=>{
-        if(ev.lengthComputable){
-            const p=Math.round(ev.loaded/ev.total*100);
-            fill.style.width=p+'%';
-            btext.textContent=p+'%';
-        }
-    };
-    xhr.onload=()=>{
-        if(xhr.status===204){
-            bar.style.display='none';
-            file.value='';
-            updateFileCount();
-            loadHistory();
-        } else {
-            alert('上传失败: ' + xhr.status);
-            bar.style.display='none';
-            btn.disabled=false;
-            btn.textContent='上传选中文件';
-        }
-    };
-    xhr.onerror=()=>{
-        alert('上传错误');
-        bar.style.display='none';
-        btn.disabled=false;
-        btn.textContent='上传选中文件';
-    };
-    xhr.send(fd);
-};
+    async function api(url, options = {{}}) {{
+      const res = await fetch(url, {{
+        ...options,
+        headers: {{
+          ...(options.headers || {{}}),
+          "X-Auth-Token": token
+        }}
+      }});
+      const data = await res.json().catch(() => ({{ ok: false, message: "Request failed." }}));
+      if (!res.ok || !data.ok) {{
+        throw new Error(data.message || "Request failed.");
+      }}
+      return data;
+    }}
 
-clearBtn.onclick=()=>{
-    if(confirm('确定清空所有记录？')){
-        fetch('/api/clear', {method:'POST'})
-            .then(() => loadHistory())
-            .catch(err => console.error('Clear error:', err));
-    }
-};
+    async function loadFiles() {{
+      try {{
+        const data = await api("/api/files");
+        fileList.textContent = "";
 
-function formatSize(bytes){
-    const units=['B','KB','MB','GB'];
-    let size=bytes;
-    let i=0;
-    while(size>=1024&&i<units.length-1){
-        size/=1024;
-        i++;
-    }
-    return (Math.round(size*10)/10) + ' ' + units[i];
-}
+        for (const file of data.files) {{
+          const li = document.createElement("li");
+          li.className = "file-item";
 
-function loadHistory(){
-    fetch('/api/history')
-        .then(response => response.json())
-        .then(rows => {
-            if(!rows.length){
-                list.innerHTML='<div class="empty">暂无记录</div>';
-                return;
-            }
-            list.innerHTML=rows.map(r=>{
-                const encodedName=encodeURIComponent(r.name);
-                return `
-                <div class="row" id="r-${r.id}">
-                    <div class="info">
-                        <div class="fname" title="${r.name}">${r.name}</div>
-                        <meta>${r.uploaded_at} · ${formatSize(r.size)}</meta>
-                    </div>
-                    <a class="dl" href="/uploads/${encodedName}">下载</a>
-                    <button class="del" onclick="deleteRecord('${r.id}')">✕</button>
-                </div>`;
-            }).join('');
-        })
-        .catch(err => console.error('Load history error:', err));
-}
+          const meta = document.createElement("div");
+          meta.className = "meta";
 
-function deleteRecord(id){
-    fetch('/api/delete', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({id:id})
-    })
-    .then(() => loadHistory())
-    .catch(err => console.error('Delete error:', err));
-}
+          const name = document.createElement("div");
+          name.className = "name";
+          name.textContent = file.name;
 
-// Load history on page load
-document.addEventListener('DOMContentLoaded', loadHistory);
-</script>
+          const sub = document.createElement("div");
+          sub.className = "sub";
+          sub.textContent = `${{formatSize(file.size)}} · ${{new Date(file.modifiedAt).toLocaleString()}}`;
+
+          meta.appendChild(name);
+          meta.appendChild(sub);
+
+          const link = document.createElement("a");
+          link.textContent = "下载";
+          link.href = `/download?file=${{encodeURIComponent(file.name)}}&token=${{encodeURIComponent(token)}}`;
+
+          const del = document.createElement("button");
+          del.className = "delete";
+          del.textContent = "删除";
+          del.addEventListener("click", async () => {{
+            try {{
+              setStatus("处理中...");
+              await api(`/delete?file=${{encodeURIComponent(file.name)}}`, {{ method: "DELETE" }});
+              setStatus("删除完成。");
+              await loadFiles();
+            }} catch (err) {{
+              setStatus(err.message);
+            }}
+          }});
+
+          li.appendChild(meta);
+          li.appendChild(link);
+          li.appendChild(del);
+          fileList.appendChild(li);
+        }}
+
+        if (!data.files.length) {{
+          const empty = document.createElement("li");
+          empty.className = "file-item";
+          empty.textContent = "暂无文件";
+          fileList.appendChild(empty);
+        }}
+      }} catch (err) {{
+        setStatus(err.message);
+      }}
+    }}
+
+    uploadBtn.addEventListener("click", async () => {{
+      const file = fileInput.files[0];
+      if (!file) {{
+        setStatus("请选择文件。");
+        return;
+      }}
+      if (file.size > maxSize) {{
+        setStatus("文件超过大小限制。");
+        return;
+      }}
+
+      uploadBtn.disabled = true;
+      try {{
+        setStatus("上传中...");
+        await api("/upload", {{
+          method: "POST",
+          headers: {{
+            "Content-Type": "application/octet-stream",
+            "X-Filename": encodeURIComponent(file.name)
+          }},
+          body: file
+        }});
+        fileInput.value = "";
+        setStatus("上传完成。");
+        await loadFiles();
+      }} catch (err) {{
+        setStatus(err.message);
+      }} finally {{
+        uploadBtn.disabled = false;
+      }}
+    }});
+
+    loadFiles();
+  </script>
 </body>
-</html>
-"""
+</html>"""
 
 
-class RequestHandler(SimpleHTTPRequestHandler):
-    server_instance = None  # Will be set to the FileUploadServer instance
-    
-    def do_GET(self):
-        if self.path == "/" or self.path.startswith("/?"):
-            self.serve_page()
-        elif self.path.startswith("/uploads/"):
-            # Serve uploaded files
-            filename = self.path[len("/uploads/"):]
-            filepath = os.path.join(self.server_instance.upload_dir, filename)
-            
-            if os.path.exists(filepath) and os.path.isfile(filepath):
-                self.serve_file(filepath)
-            else:
-                self.send_error(404)
-        elif self.path == "/api/history":
-            self.serve_history()
-        else:
-            self.send_error(404)
-
-    def do_POST(self):
-        if self.path == "/upload":
-            self.handle_upload()
-        elif self.path == "/api/delete":
-            self.handle_delete()
-        elif self.path == "/api/clear":
-            self.handle_clear()
-        else:
-            self.send_error(404)
-
-    def serve_page(self):
-        """Serve the main upload page."""
-        body = HTML_TEMPLATE.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def serve_file(self, filepath):
-        """Serve an uploaded file."""
-        try:
-            with open(filepath, 'rb') as f:
-                self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
-                self.send_header("Content-Length", str(os.path.getsize(filepath)))
-                self.end_headers()
-                self.wfile.write(f.read())
-        except Exception as e:
-            self.send_error(500, f"Error reading file: {str(e)}")
-
-    def serve_history(self):
-        """Serve the upload history as JSON."""
-        try:
-            records = self.server_instance.get_upload_records()
-            data = json.dumps(records).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-        except Exception as e:
-            self.send_error(500, f"Error getting history: {str(e)}")
-
-    def handle_upload(self):
-        """Handle file upload POST request."""
-        try:
-            content_length = int(self.headers.get("Content-Length", 0))
-            if content_length == 0:
-                self.send_error(400, "No content")
-                return
-
-            content_type = self.headers.get("Content-Type", "")
-            if not content_type.startswith("multipart/form-data"):
-                self.send_error(400, "Invalid content type")
-                return
-
-            # Parse multipart data manually
-            boundary = content_type.split("boundary=")[-1].encode()
-            raw_data = self.rfile.read(content_length)
-            parts = raw_data.split(b"--" + boundary)
-
-            uploaded_any = False
-            
-            for part in parts:
-                # Find the header section
-                header_end_idx = part.find(b"\r\n\r\n")
-                if header_end_idx == -1:
-                    continue
-                
-                header_section = part[:header_end_idx].decode("utf-8", errors="ignore")
-                
-                # Check if this part contains a file
-                if 'filename="' not in header_section:
-                    continue
-                
-                # Extract filename
-                filename_start = header_section.find('filename="') + len('filename="')
-                filename_end = header_section.find('"', filename_start)
-                if filename_start == -1 or filename_end == -1:
-                    continue
-                
-                filename = header_section[filename_start:filename_end]
-                if not filename:
-                    continue
-                
-                # Extract file content
-                content = part[header_end_idx + 4:]
-                # Remove trailing boundary if present
-                if content.endswith(b"\r\n"):
-                    content = content[:-2]
-                
-                if not content:
-                    continue
-                
-                # Save file
-                filepath = os.path.join(self.server_instance.upload_dir, filename)
-                
-                # Handle duplicate filenames
-                if os.path.exists(filepath):
-                    base, ext = os.path.splitext(filename)
-                    counter = 1
-                    while os.path.exists(filepath):
-                        new_filename = f"{base}_{counter}{ext}"
-                        filepath = os.path.join(self.server_instance.upload_dir, new_filename)
-                        counter += 1
-                    filename = new_filename
-                
-                with open(filepath, "wb") as f:
-                    f.write(content)
-                
-                # Add record to database
-                self.server_instance.add_upload_record(filename, len(content))
-                uploaded_any = True
-
-            if uploaded_any:
-                self.send_response(204)  # Success, no content
-            else:
-                self.send_error(400, "No valid files found in upload")
-            
-            self.end_headers()
-            
-        except Exception as e:
-            print(f"Upload error: {str(e)}")
-            self.send_error(500, f"Upload error: {str(e)}")
-
-    def handle_delete(self):
-        """Handle record deletion."""
-        try:
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length)
-            data = json.loads(body.decode("utf-8"))
-            
-            record_id = data.get("id")
-            if not record_id:
-                self.send_error(400, "Missing record id")
-                return
-            
-            self.server_instance.delete_upload_record(record_id)
-            self.send_response(200)
-            self.end_headers()
-            
-        except Exception as e:
-            print(f"Delete error: {str(e)}")
-            self.send_error(500, f"Delete error: {str(e)}")
-
-    def handle_clear(self):
-        """Handle clearing all records."""
-        try:
-            self.server_instance.clear_all_records()
-            self.send_response(200)
-            self.end_headers()
-            
-        except Exception as e:
-            print(f"Clear error: {str(e)}")
-            self.send_error(500, f"Clear error: {str(e)}")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="文件上传服务器")
-    parser.add_argument("-p", "--port", type=int, default=8000, help="Port to run server on")
-    args = parser.parse_args()
-
-    # Get the directory where the script is located
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    server_instance = FileUploadServer(script_dir)
-
-    # Auto-detect local IP
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-    except Exception:
-        ip = "127.0.0.1"
-    finally:
-        s.close()
-
-    # Set the server instance for the handler
-    RequestHandler.server_instance = server_instance
-
-    server_address = ("0.0.0.0", args.port)
-    httpd = HTTPServer(server_address, RequestHandler)
-
-    print(f"\n  ✅ 上传服务已启动")
-    print(f"  📱 手机浏览器访问: http://{ip}:{args.port}")
-    print(f"  📁 上传文件目录: {server_instance.upload_dir}")
-    print(f"  🗂️  数据库位置: {server_instance.db_path}")
-    print(f"  ⏹️  按 Ctrl+C 停止服务\n")
-
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        print("\n👋 服务已停止")
-        httpd.server_close()
+def main() -> None:
+    server = ThreadingHTTPServer((HOST, PORT), UploadHandler)
+    print(f"Serving on http://{HOST}:{PORT}")
+    print(f"Upload directory: {UPLOAD_DIR}")
+    print(f"Auth token: {AUTH_TOKEN}")
+    server.serve_forever()
 
 
 if __name__ == "__main__":
