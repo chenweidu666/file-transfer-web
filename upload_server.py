@@ -1,330 +1,303 @@
 #!/usr/bin/env python3
-"""文件上传服务器 - 支持手机浏览器上传文件到电脑"""
+"""文件上传服务器 — 手机浏览器传文件到电脑"""
 
 import os
+import json
+import time
+import sqlite3
 import html
+import socket
 import uuid
+from datetime import datetime
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 import argparse
+import threading
 
-UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+DB_PATH = os.path.join(BASE_DIR, "upload.db")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-HTML = """<!DOCTYPE html>
+# ── SQLite ────────────────────────────────────────────────
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS uploads (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            uploaded_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def add_record(conn, name, size):
+    rid = uuid.uuid4().hex[:12]
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute("INSERT INTO uploads VALUES (?,?,?,?)", (rid, name, size, ts))
+    conn.commit()
+    return rid
+
+
+def get_records(conn):
+    rows = conn.execute(
+        "SELECT id, name, size, uploaded_at FROM uploads ORDER BY uploaded_at DESC"
+    ).fetchall()
+    return [{"id": r[0], "name": r[1], "size": r[2], "uploaded_at": r[3]} for r in rows]
+
+
+def delete_record(conn, rid):
+    conn.execute("DELETE FROM uploads WHERE id = ?", (rid,))
+    conn.commit()
+
+
+def clear_records(conn):
+    conn.execute("DELETE FROM uploads")
+    conn.commit()
+
+
+# ── HTML templates ────────────────────────────────────────
+
+PAGE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>文件上传</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-        .container {
-            max-width: 500px;
-            margin: 40px auto;
-            background: white;
-            border-radius: 16px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            overflow: hidden;
-        }
-        .header {
-            background: linear-gradient(135deg, #4f46e5, #7c3aed);
-            color: white;
-            padding: 24px;
-            text-align: center;
-        }
-        .header h1 { font-size: 24px; margin-bottom: 8px; }
-        .header p { opacity: 0.8; font-size: 14px; }
-        .body { padding: 24px; }
-        .drop-zone {
-            border: 2px dashed #ccc;
-            border-radius: 12px;
-            padding: 30px;
-            text-align: center;
-            background: #fafafa;
-            transition: all 0.3s;
-            cursor: pointer;
-            margin-bottom: 20px;
-        }
-        .drop-zone:hover, .drop-zone.dragover {
-            border-color: #4f46e5;
-            background: #eef2ff;
-        }
-        .drop-zone p { color: #666; margin-bottom: 10px; }
-        .drop-zone .icon { font-size: 48px; margin-bottom: 10px; }
-        #fileInput { display: none; }
-        .btn {
-            width: 100%;
-            padding: 14px;
-            background: linear-gradient(135deg, #4f46e5, #7c3aed);
-            color: white;
-            border: none;
-            border-radius: 10px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: transform 0.2s, box-shadow 0.2s;
-        }
-        .btn:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(79,70,229,0.4); }
-        .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
-        .file-list { margin-top: 24px; }
-        .file-list h3 { font-size: 16px; margin-bottom: 12px; color: #333; }
-        .file-item {
-            display: flex;
-            align-items: center;
-            padding: 10px 12px;
-            background: #f8f9fa;
-            border-radius: 8px;
-            margin-bottom: 8px;
-        }
-        .file-item span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .file-item a { color: #4f46e5; text-decoration: none; font-size: 14px; margin-right: 10px; }
-        .file-item .size { color: #888; font-size: 12px; white-space: nowrap; }
-        .alert {
-            padding: 12px;
-            border-radius: 8px;
-            margin-bottom: 16px;
-            font-size: 14px;
-        }
-        .alert.success { background: #dcfce7; color: #166534; }
-        .alert.error { background: #fee2e2; color: #991b1b; }
-        .empty { text-align: center; color: #999; padding: 20px; }
-        .progress { display: none; margin-top: 12px; }
-        .progress-bar {
-            height: 6px;
-            background: #e5e7eb;
-            border-radius: 3px;
-            overflow: hidden;
-        }
-        .progress-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #4f46e5, #7c3aed);
-            width: 0%;
-            transition: width 0.3s;
-        }
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>文件上传</title>
+  <style>
+    :root { --primary: #4f46e5; --bg: #f1f5f9; --card: #fff; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: var(--bg); padding: 16px; }
+    .wrap { max-width: 520px; margin: 0 auto; }
+
+    /* upload card */
+    .card { background: var(--card); border-radius: 14px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 16px; }
+    .card h2 { font-size: 18px; margin-bottom: 16px; }
+
+    .drop { border: 2px dashed #cbd5e1; border-radius: 12px; padding: 28px 16px; text-align: center; cursor: pointer; transition: .2s; background: #f8fafc; }
+    .drop:hover, .drop.over { border-color: var(--primary); background: #eef2ff; }
+    .drop input { display: none; }
+    .drop p { color: #64748b; margin-top: 8px; font-size: 14px; }
+
+    .btn { display: block; width: 100%; padding: 13px; background: var(--primary); color: #fff; border: none; border-radius: 10px; font-size: 15px; font-weight: 600; margin-top: 14px; cursor: pointer; }
+    .btn:disabled { opacity: .5; }
+
+    .bar { display: none; margin-top: 12px; }
+    .bar-track { height: 8px; background: #e2e8f0; border-radius: 4px; overflow: hidden; }
+    .bar-fill { height: 100%; width: 0; background: var(--primary); border-radius: 4px; transition: width .15s; }
+    .bar-text { text-align: center; font-size: 13px; color: #64748b; margin-top: 4px; }
+
+    /* history */
+    .hist { margin-top: 8px; }
+    .hist-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    .hist-head h3 { font-size: 16px; }
+    .hist-head button { font-size: 12px; color: #94a3b8; background: none; border: none; cursor: pointer; }
+
+    .row { display: flex; align-items: center; padding: 10px 12px; background: #f8fafc; border-radius: 10px; margin-bottom: 6px; gap: 8px; }
+    .row .info { flex: 1; min-width: 0; }
+    .row .fname { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .row meta { display: block; font-size: 12px; color: #94a3b8; }
+    .row .dl { color: var(--primary); font-size: 13px; text-decoration: none; }
+    .row .del { background: none; border: none; color: #ef4444; font-size: 18px; cursor: pointer; padding: 0 4px; }
+    .empty { text-align: center; color: #94a3b8; padding: 20px 0; font-size: 14px; }
+  </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>📤 文件上传</h1>
-            <p>从手机上传文件到电脑</p>
-        </div>
-        <div class="body">
-            {ALERT}
-            <form id="uploadForm" method="post" enctype="multipart/form-data" action="/upload">
-                <div class="drop-zone" id="dropZone">
-                    <div class="icon">📁</div>
-                    <p>点击选择文件或拖放文件</p>
-                    <input type="file" name="file" id="fileInput" multiple>
-                </div>
-                <div class="progress" id="progress">
-                    <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
-                </div>
-                <button type="submit" class="btn" id="submitBtn" disabled>上传选中文件</button>
-            </form>
-            <div class="file-list">
-                <h3>已上传 ({COUNT} 个文件)</h3>
-                <div id="fileList">{FILE_LIST}</div>
-            </div>
-        </div>
+<div class="wrap">
+  <div class="card">
+    <h2>📤 上传文件</h2>
+    <form id="form">
+      <div class="drop" id="drop">
+        <span style="font-size:36px">📁</span>
+        <p>点我选择 或 拖放文件</p>
+        <input type="file" id="file" multiple>
+      </div>
+      <div class="bar" id="bar">
+        <div class="bar-track"><div class="bar-fill" id="fill"></div></div>
+        <div class="bar-text" id="btext">0%</div>
+      </div>
+      <button type="submit" class="btn" id="btn" disabled>上传选中文件</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <div class="hist">
+      <div class="hist-head">
+        <h3>📋 上传记录</h3>
+        <button id="clearBtn">清空记录</button>
+      </div>
+      <div id="list"><div class="empty">暂无记录</div></div>
     </div>
-    <script>
-        const dropZone = document.getElementById('dropZone');
-        const fileInput = document.getElementById('fileInput');
-        const submitBtn = document.getElementById('submitBtn');
-        const form = document.getElementById('uploadForm');
-        const progress = document.getElementById('progress');
-        const progressFill = document.getElementById('progressFill');
+  </div>
+</div>
 
-        dropZone.addEventListener('click', () => fileInput.click());
-        dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
-        dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
-        dropZone.addEventListener('drop', e => {
-            e.preventDefault();
-            dropZone.classList.remove('dragover');
-            fileInput.files = e.dataTransfer.files;
-            updateFileCount();
-        });
-        fileInput.addEventListener('change', updateFileCount);
+<script>
+const drop=document.getElementById('drop'),file=document.getElementById('file'),
+      form=document.getElementById('form'),btn=document.getElementById('btn'),
+      bar=document.getElementById('bar'),fill=document.getElementById('fill'),
+      btext=document.getElementById('btext'),list=document.getElementById('list'),
+      clearBtn=document.getElementById('clearBtn');
 
-        function updateFileCount() {
-            const count = fileInput.files.length;
-            submitBtn.disabled = count === 0;
-            submitBtn.textContent = count ? `上传 ${count} 个文件` : '上传选中文件';
-        }
+drop.onclick=()=>file.click();
+drop.ondragover=e=>{e.preventDefault();drop.classList.add('over')};
+drop.ondragleave=()=>drop.classList.remove('over');
+drop.ondrop=e=>{e.preventDefault();drop.classList.remove('over');file.files=e.dataTransfer.files;upd()};
+file.onchange=upd;
+function upd(){const n=file.files.length;btn.disabled=!n;btn.textContent=n?`上传 ${n} 个文件`:'上传选中文件'}
 
-        form.addEventListener('submit', e => {
-            e.preventDefault();
-            const formData = new FormData(form);
-            progress.style.display = 'block';
-            submitBtn.disabled = true;
-            submitBtn.textContent = '上传中...';
+form.onsubmit=e=>{e.preventDefault();if(!file.files.length)return;
+  bar.style.display='block';btn.disabled=true;btn.textContent='上传中...';fill.style.width='0%';
+  const fd=new FormData();for(const f of file.files) fd.append('file',f,f.name);
+  const xhr=new XMLHttpRequest();
+  xhr.open('POST','/upload');
+  xhr.upload.onprogress=ev=>{if(ev.lengthComputable){const p=Math.round(ev.loaded/ev.total*100);fill.style.width=p+'%';btext.textContent=p+'%'}};
+  xhr.onload=()=>{bar.style.display='none';file.value='';upd();loadHist()};
+  xhr.send(fd)};
 
-            const xhr = new XMLHttpRequest();
-            xhr.upload.addEventListener('progress', e => {
-                if (e.lengthComputable) progressFill.style.width = (e.loaded / e.total * 100) + '%';
-            });
-            xhr.addEventListener('load', () => {
-                window.location.href = xhr.responseURL;
-            });
-            xhr.send(formData);
-        });
-    </script>
+clearBtn.onclick=()=>{if(confirm('确定清空所有记录？'))fetch('/api/clear',{method:'POST'}).then(loadHist)};
+
+function fmtSize(b){const u=['B','KB','MB','GB'];let i=0;let s=b;while(s>=1024&&i<u.length-1){s/=1024;i++}return(s%1?toFixed(1):s)+' '+u[i]}
+function loadHist(){fetch('/api/history').then(r=>r.json()).then(rows=>{
+  if(!rows.length){list.innerHTML='<div class="empty">暂无记录</div>';return}
+  list.innerHTML=rows.map(r=>{
+    const n=r.name.replace(/'/g,"\\'"),m=fmtSize(r.size);
+    return(`<div class="row" id="r-${r.id}"><div class="info"><div class="fname" title="${n}">${n}</div><meta>${r.uploaded_at} · ${m}</meta></div><a class="dl" href="/uploads/${encodeURIComponent(r.name)}">下载</a><button class="del" onclick="del('${r.id}')">✕</button></div>`)
+  }).join('')
+})}
+window.del=function(id){fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}).then(loadHist)};
+loadHist();
+</script>
 </body>
 </html>
 """
 
 
-def format_size(size_bytes):
-    for unit in ["B", "KB", "MB", "GB"]:
-        if size_bytes < 1024:
-            return f"{size_bytes:.1f} {unit}"
-        size_bytes /= 1024
-
+# ── Handler ────────────────────────────────────────────────
 
 class Handler(SimpleHTTPRequestHandler):
+    db = None  # shared connection
+
     def do_GET(self):
         if self.path == "/" or self.path.startswith("/?"):
-            self.send_html()
+            body = PAGE.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/api/history":
+            rows = get_records(self.db)
+            data = json.dumps(rows).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(data)
         elif self.path.startswith("/uploads/"):
             super().do_GET()
-        elif self.path == "/api/files":
-            self.send_json()
         else:
             self.send_error(404)
 
     def do_POST(self):
         if self.path == "/upload":
+            self._upload()
+        elif self.path == "/api/delete":
             length = int(self.headers.get("Content-Length", 0))
-            content_type = self.headers.get("Content-Type", "")
-            if "boundary=" in content_type:
-                boundary = content_type.split("boundary=")[-1].encode()
-                data = self.rfile.read(length)
-                self._parse_and_save(data, boundary)
-                return
-        self.send_error(400)
-
-    def send_html(self):
-        files = self._get_files()
-        alert = ""
-        if "?ok=1" in self.path:
-            alert = '<div class="alert success">✅ 文件上传成功！</div>'
-        elif "?err=1" in self.path:
-            alert = '<div class="alert error">❌ 上传失败，请重试</div>'
-
-        file_list_html = ""
-        if files:
-            for f in files:
-                size = format_size(f["size"])
-                file_list_html += f"""
-                    <div class="file-item">
-                        <span title="{html.escape(f['name'])}">{html.escape(f['name'])}</span>
-                        <span class="size">{size}</span>
-                    </div>
-                """
+            body = json.loads(self.rfile.read(length))
+            delete_record(self.db, body["id"])
+            self._empty(200)
+        elif self.path == "/api/clear":
+            clear_records(self.db)
+            self._empty(200)
         else:
-            file_list_html = '<div class="empty">暂无文件</div>'
+            self.send_error(404)
 
-        body = (
-            HTML.replace("{ALERT}", alert)
-            .replace("{COUNT}", str(len(files)))
-            .replace("{FILE_LIST}", file_list_html)
-        )
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(body.encode())
+    def _upload(self):
+        length = int(self.headers.get("Content-Length", 0))
+        ct = self.headers.get("Content-Type", "")
 
-    def send_json(self):
-        files = self._get_files()
-        import json
+        if "boundary=" not in ct:
+            self._empty(400)
+            return
 
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps(files).encode())
-
-    def _get_files(self):
-        files = []
-        if os.path.exists(UPLOAD_DIR):
-            for name in sorted(os.listdir(UPLOAD_DIR), key=lambda x: os.path.getmtime(os.path.join(UPLOAD_DIR, x)), reverse=True):
-                path = os.path.join(UPLOAD_DIR, name)
-                if os.path.isfile(path):
-                    files.append({"name": name, "size": os.path.getsize(path)})
-        return files
-
-    def _parse_and_save(self, data, boundary):
+        boundary = ct.split("boundary=")[-1].encode()
+        data = self.rfile.read(length)
         parts = data.split(b"--" + boundary)
-        saved = False
+
         for part in parts:
-            if b"filename=" in part:
-                header_end = part.find(b"\r\n\r\n")
-                if header_end == -1:
-                    continue
-                header = part[:header_end].decode(errors="ignore")
-                rest = part[header_end + 4 :]
-                content = rest.rstrip(b"\r\n").rstrip(b"--\r\n")
+            idx = part.find(b"\r\n\r\n")
+            if idx == -1:
+                continue
+            header = part[:idx].decode(errors="ignore")
 
-                if "filename=" not in header:
-                    continue
+            if 'filename="' not in header:
+                continue
 
-                name = header.split('filename="')[1].split('"')[0]
-                if not name or not content:
-                    continue
+            fname = header.split('filename="')[1].split('"')[0]
+            if not fname:
+                continue
 
-                # 避免覆盖
-                path = os.path.join(UPLOAD_DIR, name)
-                if os.path.exists(path):
-                    base, ext = os.path.splitext(name)
-                    i = 1
-                    while os.path.exists(path):
-                        path = os.path.join(UPLOAD_DIR, f"{base}_{i}{ext}")
-                        i += 1
+            content = part[idx + 4:].rstrip(b"\r\n").rstrip(b"--\r\n")
+            if not content:
+                continue
 
-                with open(path, "wb") as f:
-                    f.write(content)
-                saved = True
-                break
+            # 避免覆盖
+            path = os.path.join(UPLOAD_DIR, fname)
+            if os.path.exists(path):
+                base, ext = os.path.splitext(fname)
+                i = 1
+                while os.path.exists(path):
+                    path = os.path.join(UPLOAD_DIR, f"{base}_{i}{ext}")
+                    i += 1
 
-        self.send_response(302)
-        self.send_header("Location", "/?ok=1" if saved else "/?err=1")
+            with open(path, "wb") as f:
+                f.write(content)
+            add_record(self.db, fname, os.path.getsize(path))
+            break
+
+        self._empty(204)
+
+    def _empty(self, code):
+        self.send_response(code)
         self.end_headers()
 
     def log_message(self, fmt, *args):
-        print(f"[{self.log_date_time_string()}] {fmt % args}")
+        pass  # silent
 
+
+# ── Main ───────────────────────────────────────────────────
 
 def main():
-    import socket
-
     parser = argparse.ArgumentParser(description="文件上传服务器")
-    parser.add_argument("-p", "--port", type=int, default=8000, help="端口号 (默认 8000)")
-    parser.add_argument("--host", default="0.0.0.0", help="绑定地址")
+    parser.add_argument("-p", "--port", type=int, default=8000)
     args = parser.parse_args()
 
-    # 获取本机 IP
+    # auto-detect LAN IP
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.connect(("8.8.8.8", 80))
-    local_ip = s.getsockname()[0]
-    s.close()
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    finally:
+        s.close()
 
-    server = HTTPServer((args.host, args.port), Handler)
-    print(f"\n  ✅ 文件上传服务已启动！")
-    print(f"  📱 手机浏览器访问: http://{local_ip}:{args.port}")
-    print(f"  📁 上传文件保存位置: {UPLOAD_DIR}")
-    print(f"  ⏹️  按 Ctrl+C 停止服务\n")
+    url = f"http://{ip}:{args.port}"
+    Handler.db = init_db()
+
+    server = HTTPServer(("0.0.0.0", args.port), Handler)
+
+    print(f"  ✅ 上传服务已启动")
+    print(f"  📱 手机浏览器访问: {url}")
+    print(f"  📁 文件目录: {UPLOAD_DIR}")
+    print(f"  ⏹️  Ctrl+C 停止\n")
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n👋 服务已停止")
+        print("\n👋 已停止")
         server.server_close()
+        Handler.db.close()
 
 
 if __name__ == "__main__":
