@@ -11,58 +11,99 @@ import uuid
 from datetime import datetime
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 import argparse
-import threading
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
-UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
-DB_PATH = os.path.join(DATA_DIR, "upload.db")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# ── SQLite ────────────────────────────────────────────────
+class FileUploadServer:
+    def __init__(self, base_dir):
+        self.base_dir = base_dir
+        self.data_dir = os.path.join(base_dir, "data")
+        self.upload_dir = os.path.join(self.data_dir, "uploads")
+        self.db_path = os.path.join(self.data_dir, "upload.db")
+        
+        # Create directories
+        os.makedirs(self.upload_dir, exist_ok=True)
+        os.makedirs(self.data_dir, exist_ok=True)
+        
+        # Initialize database
+        self.init_db()
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS uploads (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            size INTEGER NOT NULL,
-            uploaded_at TEXT NOT NULL
+    def init_db(self):
+        """Initialize SQLite database for upload records."""
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS uploads (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                uploaded_at TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def add_upload_record(self, filename, size):
+        """Add a record of uploaded file to the database."""
+        conn = sqlite3.connect(self.db_path)
+        record_id = uuid.uuid4().hex[:12]
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        conn.execute(
+            "INSERT INTO uploads (id, name, size, uploaded_at) VALUES (?, ?, ?, ?)",
+            (record_id, filename, size, timestamp)
         )
-    """)
-    conn.commit()
-    return conn
+        conn.commit()
+        conn.close()
+        return record_id
+
+    def get_upload_records(self):
+        """Get all upload records from the database."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.execute(
+            "SELECT id, name, size, uploaded_at FROM uploads ORDER BY uploaded_at DESC"
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        
+        return [
+            {"id": row[0], "name": row[1], "size": row[2], "uploaded_at": row[3]}
+            for row in rows
+        ]
+
+    def delete_upload_record(self, record_id):
+        """Delete a specific upload record and associated file."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.execute(
+            "SELECT name FROM uploads WHERE id = ?", (record_id,)
+        )
+        result = cursor.fetchone()
+        
+        if result:
+            filename = result[0]
+            filepath = os.path.join(self.upload_dir, filename)
+            if os.path.exists(filepath):
+                os.remove(filepath)
+            
+            conn.execute("DELETE FROM uploads WHERE id = ?", (record_id,))
+            conn.commit()
+        
+        conn.close()
+
+    def clear_all_records(self):
+        """Clear all upload records and associated files."""
+        records = self.get_upload_records()
+        conn = sqlite3.connect(self.db_path)
+        
+        for record in records:
+            filepath = os.path.join(self.upload_dir, record["name"])
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        
+        conn.execute("DELETE FROM uploads")
+        conn.commit()
+        conn.close()
 
 
-def add_record(conn, name, size):
-    rid = uuid.uuid4().hex[:12]
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    conn.execute("INSERT INTO uploads VALUES (?,?,?,?)", (rid, name, size, ts))
-    conn.commit()
-    return rid
-
-
-def get_records(conn):
-    rows = conn.execute(
-        "SELECT id, name, size, uploaded_at FROM uploads ORDER BY uploaded_at DESC"
-    ).fetchall()
-    return [{"id": r[0], "name": r[1], "size": r[2], "uploaded_at": r[3]} for r in rows]
-
-
-def delete_record(conn, rid):
-    conn.execute("DELETE FROM uploads WHERE id = ?", (rid,))
-    conn.commit()
-
-
-def clear_records(conn):
-    conn.execute("DELETE FROM uploads")
-    conn.commit()
-
-
-# ── HTML templates ────────────────────────────────────────
-
-PAGE = r"""<!DOCTYPE html>
+HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
@@ -145,160 +186,333 @@ const drop=document.getElementById('drop'),file=document.getElementById('file'),
 drop.onclick=()=>file.click();
 drop.ondragover=e=>{e.preventDefault();drop.classList.add('over')};
 drop.ondragleave=()=>drop.classList.remove('over');
-drop.ondrop=e=>{e.preventDefault();drop.classList.remove('over');file.files=e.dataTransfer.files;upd()};
-file.onchange=upd;
-function upd(){const n=file.files.length;btn.disabled=!n;btn.textContent=n?`上传 ${n} 个文件`:'上传选中文件'}
+drop.ondrop=e=>{e.preventDefault();drop.classList.remove('over');file.files=e.dataTransfer.files;updateFileCount()};
+file.onchange=updateFileCount;
 
-form.onsubmit=e=>{e.preventDefault();if(!file.files.length)return;
-  bar.style.display='block';btn.disabled=true;btn.textContent='上传中...';fill.style.width='0%';
-  const fd=new FormData();for(const f of file.files) fd.append('file',f,f.name);
-  const xhr=new XMLHttpRequest();
-  xhr.open('POST','/upload');
-  xhr.upload.onprogress=ev=>{if(ev.lengthComputable){const p=Math.round(ev.loaded/ev.total*100);fill.style.width=p+'%';btext.textContent=p+'%'}};
-  xhr.onload=()=>{bar.style.display='none';file.value='';upd();loadHist()};
-  xhr.send(fd)};
+function updateFileCount(){
+    const n=file.files.length;
+    btn.disabled=!n;
+    btn.textContent=n?`上传 ${n} 个文件`:'上传选中文件';
+}
 
-clearBtn.onclick=()=>{if(confirm('确定清空所有记录？'))fetch('/api/clear',{method:'POST'}).then(loadHist)};
+form.onsubmit=e=>{
+    e.preventDefault();
+    if(!file.files.length)return;
+    
+    bar.style.display='block';
+    btn.disabled=true;
+    btn.textContent='上传中...';
+    fill.style.width='0%';
+    
+    const fd=new FormData();
+    for(const f of file.files) fd.append('file',f,f.name);
+    
+    const xhr=new XMLHttpRequest();
+    xhr.open('POST','/upload');
+    xhr.upload.onprogress=ev=>{
+        if(ev.lengthComputable){
+            const p=Math.round(ev.loaded/ev.total*100);
+            fill.style.width=p+'%';
+            btext.textContent=p+'%';
+        }
+    };
+    xhr.onload=()=>{
+        if(xhr.status===204){
+            bar.style.display='none';
+            file.value='';
+            updateFileCount();
+            loadHistory();
+        } else {
+            alert('上传失败: ' + xhr.status);
+            bar.style.display='none';
+            btn.disabled=false;
+            btn.textContent='上传选中文件';
+        }
+    };
+    xhr.onerror=()=>{
+        alert('上传错误');
+        bar.style.display='none';
+        btn.disabled=false;
+        btn.textContent='上传选中文件';
+    };
+    xhr.send(fd);
+};
 
-function fmtSize(b){const u=['B','KB','MB','GB'];let i=0;let s=b;while(s>=1024&&i<u.length-1){s/=1024;i++}return(s%1?toFixed(1):s)+' '+u[i]}
-function loadHist(){fetch('/api/history').then(r=>r.json()).then(rows=>{
-  if(!rows.length){list.innerHTML='<div class="empty">暂无记录</div>';return}
-  list.innerHTML=rows.map(r=>{
-    const n=r.name.replace(/'/g,"\\'"),m=fmtSize(r.size);
-    return(`<div class="row" id="r-${r.id}"><div class="info"><div class="fname" title="${n}">${n}</div><meta>${r.uploaded_at} · ${m}</meta></div><a class="dl" href="/uploads/${encodeURIComponent(r.name)}">下载</a><button class="del" onclick="del('${r.id}')">✕</button></div>`)
-  }).join('')
-})}
-window.del=function(id){fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}).then(loadHist)};
-loadHist();
+clearBtn.onclick=()=>{
+    if(confirm('确定清空所有记录？')){
+        fetch('/api/clear', {method:'POST'})
+            .then(() => loadHistory())
+            .catch(err => console.error('Clear error:', err));
+    }
+};
+
+function formatSize(bytes){
+    const units=['B','KB','MB','GB'];
+    let size=bytes;
+    let i=0;
+    while(size>=1024&&i<units.length-1){
+        size/=1024;
+        i++;
+    }
+    return (Math.round(size*10)/10) + ' ' + units[i];
+}
+
+function loadHistory(){
+    fetch('/api/history')
+        .then(response => response.json())
+        .then(rows => {
+            if(!rows.length){
+                list.innerHTML='<div class="empty">暂无记录</div>';
+                return;
+            }
+            list.innerHTML=rows.map(r=>{
+                const encodedName=encodeURIComponent(r.name);
+                return `
+                <div class="row" id="r-${r.id}">
+                    <div class="info">
+                        <div class="fname" title="${r.name}">${r.name}</div>
+                        <meta>${r.uploaded_at} · ${formatSize(r.size)}</meta>
+                    </div>
+                    <a class="dl" href="/uploads/${encodedName}">下载</a>
+                    <button class="del" onclick="deleteRecord('${r.id}')">✕</button>
+                </div>`;
+            }).join('');
+        })
+        .catch(err => console.error('Load history error:', err));
+}
+
+function deleteRecord(id){
+    fetch('/api/delete', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({id:id})
+    })
+    .then(() => loadHistory())
+    .catch(err => console.error('Delete error:', err));
+}
+
+// Load history on page load
+document.addEventListener('DOMContentLoaded', loadHistory);
 </script>
 </body>
 </html>
 """
 
 
-# ── Handler ────────────────────────────────────────────────
-
-class Handler(SimpleHTTPRequestHandler):
-    db = None  # shared connection
-
+class RequestHandler(SimpleHTTPRequestHandler):
+    server_instance = None  # Will be set to the FileUploadServer instance
+    
     def do_GET(self):
         if self.path == "/" or self.path.startswith("/?"):
-            body = PAGE.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", len(body))
-            self.end_headers()
-            self.wfile.write(body)
-        elif self.path == "/api/history":
-            rows = get_records(self.db)
-            data = json.dumps(rows).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(data)
+            self.serve_page()
         elif self.path.startswith("/uploads/"):
-            super().do_GET()
+            # Serve uploaded files
+            filename = self.path[len("/uploads/"):]
+            filepath = os.path.join(self.server_instance.upload_dir, filename)
+            
+            if os.path.exists(filepath) and os.path.isfile(filepath):
+                self.serve_file(filepath)
+            else:
+                self.send_error(404)
+        elif self.path == "/api/history":
+            self.serve_history()
         else:
             self.send_error(404)
 
     def do_POST(self):
         if self.path == "/upload":
-            self._upload()
+            self.handle_upload()
         elif self.path == "/api/delete":
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length))
-            delete_record(self.db, body["id"])
-            self._empty(200)
+            self.handle_delete()
         elif self.path == "/api/clear":
-            clear_records(self.db)
-            self._empty(200)
+            self.handle_clear()
         else:
             self.send_error(404)
 
-    def _upload(self):
-        length = int(self.headers.get("Content-Length", 0))
-        ct = self.headers.get("Content-Type", "")
-
-        if "boundary=" not in ct:
-            self._empty(400)
-            return
-
-        boundary = ct.split("boundary=")[-1].encode()
-        data = self.rfile.read(length)
-        parts = data.split(b"--" + boundary)
-
-        for part in parts:
-            idx = part.find(b"\r\n\r\n")
-            if idx == -1:
-                continue
-            header = part[:idx].decode(errors="ignore")
-
-            if 'filename="' not in header:
-                continue
-
-            fname = header.split('filename="')[1].split('"')[0]
-            if not fname:
-                continue
-
-            content = part[idx + 4:].rstrip(b"\r\n").rstrip(b"--\r\n")
-            if not content:
-                continue
-
-            # 避免覆盖
-            path = os.path.join(UPLOAD_DIR, fname)
-            if os.path.exists(path):
-                base, ext = os.path.splitext(fname)
-                i = 1
-                while os.path.exists(path):
-                    path = os.path.join(UPLOAD_DIR, f"{base}_{i}{ext}")
-                    i += 1
-
-            with open(path, "wb") as f:
-                f.write(content)
-            add_record(self.db, fname, os.path.getsize(path))
-            break
-
-        self._empty(204)
-
-    def _empty(self, code):
-        self.send_response(code)
+    def serve_page(self):
+        """Serve the main upload page."""
+        body = HTML_TEMPLATE.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        self.wfile.write(body)
 
-    def log_message(self, fmt, *args):
-        pass  # silent
+    def serve_file(self, filepath):
+        """Serve an uploaded file."""
+        try:
+            with open(filepath, 'rb') as f:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(os.path.getsize(filepath)))
+                self.end_headers()
+                self.wfile.write(f.read())
+        except Exception as e:
+            self.send_error(500, f"Error reading file: {str(e)}")
 
+    def serve_history(self):
+        """Serve the upload history as JSON."""
+        try:
+            records = self.server_instance.get_upload_records()
+            data = json.dumps(records).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as e:
+            self.send_error(500, f"Error getting history: {str(e)}")
 
-# ── Main ───────────────────────────────────────────────────
+    def handle_upload(self):
+        """Handle file upload POST request."""
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            if content_length == 0:
+                self.send_error(400, "No content")
+                return
+
+            content_type = self.headers.get("Content-Type", "")
+            if not content_type.startswith("multipart/form-data"):
+                self.send_error(400, "Invalid content type")
+                return
+
+            # Parse multipart data manually
+            boundary = content_type.split("boundary=")[-1].encode()
+            raw_data = self.rfile.read(content_length)
+            parts = raw_data.split(b"--" + boundary)
+
+            uploaded_any = False
+            
+            for part in parts:
+                # Find the header section
+                header_end_idx = part.find(b"\r\n\r\n")
+                if header_end_idx == -1:
+                    continue
+                
+                header_section = part[:header_end_idx].decode("utf-8", errors="ignore")
+                
+                # Check if this part contains a file
+                if 'filename="' not in header_section:
+                    continue
+                
+                # Extract filename
+                filename_start = header_section.find('filename="') + len('filename="')
+                filename_end = header_section.find('"', filename_start)
+                if filename_start == -1 or filename_end == -1:
+                    continue
+                
+                filename = header_section[filename_start:filename_end]
+                if not filename:
+                    continue
+                
+                # Extract file content
+                content = part[header_end_idx + 4:]
+                # Remove trailing boundary if present
+                if content.endswith(b"\r\n"):
+                    content = content[:-2]
+                
+                if not content:
+                    continue
+                
+                # Save file
+                filepath = os.path.join(self.server_instance.upload_dir, filename)
+                
+                # Handle duplicate filenames
+                if os.path.exists(filepath):
+                    base, ext = os.path.splitext(filename)
+                    counter = 1
+                    while os.path.exists(filepath):
+                        new_filename = f"{base}_{counter}{ext}"
+                        filepath = os.path.join(self.server_instance.upload_dir, new_filename)
+                        counter += 1
+                    filename = new_filename
+                
+                with open(filepath, "wb") as f:
+                    f.write(content)
+                
+                # Add record to database
+                self.server_instance.add_upload_record(filename, len(content))
+                uploaded_any = True
+
+            if uploaded_any:
+                self.send_response(204)  # Success, no content
+            else:
+                self.send_error(400, "No valid files found in upload")
+            
+            self.end_headers()
+            
+        except Exception as e:
+            print(f"Upload error: {str(e)}")
+            self.send_error(500, f"Upload error: {str(e)}")
+
+    def handle_delete(self):
+        """Handle record deletion."""
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode("utf-8"))
+            
+            record_id = data.get("id")
+            if not record_id:
+                self.send_error(400, "Missing record id")
+                return
+            
+            self.server_instance.delete_upload_record(record_id)
+            self.send_response(200)
+            self.end_headers()
+            
+        except Exception as e:
+            print(f"Delete error: {str(e)}")
+            self.send_error(500, f"Delete error: {str(e)}")
+
+    def handle_clear(self):
+        """Handle clearing all records."""
+        try:
+            self.server_instance.clear_all_records()
+            self.send_response(200)
+            self.end_headers()
+            
+        except Exception as e:
+            print(f"Clear error: {str(e)}")
+            self.send_error(500, f"Clear error: {str(e)}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="文件上传服务器")
-    parser.add_argument("-p", "--port", type=int, default=8000)
+    parser.add_argument("-p", "--port", type=int, default=8000, help="Port to run server on")
     args = parser.parse_args()
 
-    # auto-detect LAN IP
+    # Get the directory where the script is located
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    server_instance = FileUploadServer(script_dir)
+
+    # Auto-detect local IP
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
     finally:
         s.close()
 
-    url = f"http://{ip}:{args.port}"
-    Handler.db = init_db()
+    # Set the server instance for the handler
+    RequestHandler.server_instance = server_instance
 
-    server = HTTPServer(("0.0.0.0", args.port), Handler)
+    server_address = ("0.0.0.0", args.port)
+    httpd = HTTPServer(server_address, RequestHandler)
 
-    print(f"  ✅ 上传服务已启动")
-    print(f"  📱 手机浏览器访问: {url}")
-    print(f"  📁 文件目录: {UPLOAD_DIR}")
-    print(f"  ⏹️  Ctrl+C 停止\n")
+    print(f"\n  ✅ 上传服务已启动")
+    print(f"  📱 手机浏览器访问: http://{ip}:{args.port}")
+    print(f"  📁 上传文件目录: {server_instance.upload_dir}")
+    print(f"  🗂️  数据库位置: {server_instance.db_path}")
+    print(f"  ⏹️  按 Ctrl+C 停止服务\n")
 
     try:
-        server.serve_forever()
+        httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n👋 已停止")
-        server.server_close()
-        Handler.db.close()
+        print("\n👋 服务已停止")
+        httpd.server_close()
 
 
 if __name__ == "__main__":

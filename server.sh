@@ -10,10 +10,15 @@ DEFAULT_PORT=8000
 PORT="${2:-$DEFAULT_PORT}"
 
 start() {
-    if is_running; then
-        echo "⚠️  服务已在运行 (PID: $(cat $PID_FILE))"
-        print_url
-        return
+    if [ -f "$PID_FILE" ]; then
+        pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "⚠️  服务已在运行 (PID: $pid)"
+            print_url
+            return
+        else
+            rm -f "$PID_FILE"
+        fi
     fi
 
     cd "$SCRIPT_DIR"
@@ -21,53 +26,57 @@ start() {
     nohup python3 "$SERVER_SCRIPT" -p "$PORT" > "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
 
-    sleep 1
-    if is_running; then
-        echo "✅ 服务已启动"
+    sleep 2
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        echo "✅ 服务已启动 (PID: $(cat $PID_FILE))"
         print_url
     else
         echo "❌ 启动失败，检查日志: cat $LOG_FILE"
+        rm -f "$PID_FILE"
     fi
 }
 
 stop() {
-    if ! is_running; then
+    if [ ! -f "$PID_FILE" ]; then
         echo "ℹ️  服务未运行"
         return
     fi
-    kill "$(cat "$PID_FILE")" 2>/dev/null
-    sleep 1
-    if ! is_running; then
+    
+    pid=$(cat "$PID_FILE")
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null
+        sleep 1
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null
+        fi
+        rm -f "$PID_FILE"
         echo "👋 服务已停止"
     else
-        echo "⚠️  强制停止中..."
-        kill -9 "$(cat "$PID_FILE")" 2>/dev/null
+        rm -f "$PID_FILE"
+        echo "ℹ️  服务未运行"
     fi
-    rm -f "$PID_FILE"
 }
 
 restart() {
     stop
-    sleep 1
+    sleep 2
     start
 }
 
 status() {
-    if is_running; then
-        echo "✅ 服务运行中 (PID: $(cat "$PID_FILE"))"
+    if [ ! -f "$PID_FILE" ]; then
+        echo "⏹️  服务未运行"
+        return
+    fi
+    
+    pid=$(cat "$PID_FILE")
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "✅ 服务运行中 (PID: $pid)"
         print_url
     else
+        rm -f "$PID_FILE"
         echo "⏹️  服务未运行"
     fi
-}
-
-is_running() {
-    if [ -f "$PID_FILE" ]; then
-        pid=$(cat "$PID_FILE")
-        kill -0 "$pid" 2>/dev/null
-        return $?
-    fi
-    return 1
 }
 
 print_url() {
