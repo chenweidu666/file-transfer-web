@@ -1,4 +1,4 @@
-# File Transfer Web
+# TOOL-File-Transfer-Web
 
 <p align="center">
   <strong>Simple Web-Based File Transfer Between Devices on Local Network</strong>
@@ -65,7 +65,7 @@
 ## 🗂️ Directory Structure
 
 ```
-file-transfer-web/
+TOOL-File-Transfer-Web/
 ├── upload_server.py         # Main server application
 ├── server.sh                # Server management script
 ├── data/                    # Auto-generated data directory

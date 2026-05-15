@@ -1,4 +1,4 @@
-# File Transfer Web
+# TOOL-File-Transfer-Web
 
 <p align="center">
   <strong>局域网站设备间文件传输工具</strong>
@@ -65,7 +65,7 @@
 ## 🗂️ 目录结构
 
 ```
-file-transfer-web/
+TOOL-File-Transfer-Web/
 ├── upload_server.py         # 主服务器程序
 ├── server.sh                # 服务器管理脚本
 ├── data/                    # 自动生成的数据目录
