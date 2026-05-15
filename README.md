@@ -64,9 +64,10 @@ python3 upload_server.py
 
 ```
 file-upload-server/
-├── upload_server.py   # 主程序
-├── uploads/           # 上传文件存储目录（自动创建）
-├── upload.db          # 上传记录数据库（自动创建）
+├── upload_server.py         # 主程序
+├── data/                    # 自动生成，不入库
+│   ├── uploads/             # 上传文件存储目录
+│   └── upload.db            # 上传记录数据库
 └── README.md
 ```
 

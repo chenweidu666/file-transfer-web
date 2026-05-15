@@ -14,8 +14,9 @@ import argparse
 import threading
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-DB_PATH = os.path.join(BASE_DIR, "upload.db")
+DATA_DIR = os.path.join(BASE_DIR, "data")
+UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
+DB_PATH = os.path.join(DATA_DIR, "upload.db")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ── SQLite ────────────────────────────────────────────────
